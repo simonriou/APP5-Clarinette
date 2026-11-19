@@ -5,6 +5,8 @@ from scipy.io import wavfile
 from numba import njit
 from time import time
 
+import matplotlib.pyplot as plt
+
 def charger_parametres(fichier="config.json"):
     with open(fichier, 'r') as f:
         return json.load(f)
@@ -81,13 +83,12 @@ def simuler_boucle_numba_oversampled(omega, alpha, F_n, gamma_array_sim, zeta, f
             
     return p_out
 
-def simuler_auto_oscillation_depuis_fichier(fichier_freqs, t_env, gamma_env, zeta, fs, duree):
-    # Lecture des données modales depuis le fichier CSV
+def simuler_auto_oscillation_depuis_fichier(fichier_freqs, N_modes, t_env, gamma_env, zeta, fs, duree, amp_bruit_gamma=0.0):
     data = np.loadtxt(fichier_freqs, delimiter=',', skiprows=1)
     if data.ndim == 1:
         data = data.reshape(1, -1)
         
-    N = data.shape[0]
+    N = N_modes
     omega = 2 * np.pi * data[:, 1]
     alpha = data[:, 2]
     F_n = data[:, 4]
@@ -97,6 +98,14 @@ def simuler_auto_oscillation_depuis_fichier(fichier_freqs, t_env, gamma_env, zet
     
     t_eval_sim = np.arange(0, duree, 1.0 / fs_sim)
     gamma_array_sim = np.interp(t_eval_sim, t_env, gamma_env)
+
+    # --- AJOUT DU BRUIT SUR p_bouche (via gamma) ---
+    if amp_bruit_gamma > 0:
+        bruit = np.random.normal(0.0, amp_bruit_gamma, size=len(gamma_array_sim))
+        # On n'applique le bruit que lorsque le musicien souffle (gamma > 0)
+        gamma_array_sim = np.where(gamma_array_sim > 1e-9, gamma_array_sim + bruit, 0.0)
+        gamma_array_sim = np.maximum(gamma_array_sim, 0.0)  # Sécurité pour sqrt(gamma)
+
     t_eval_audio = np.arange(0, duree, 1.0 / fs)
 
     print(f"Intégration RK4 optimisée (suréchantillonnage x{oversample}) sur {duree}s avec {N} modes...")
@@ -105,7 +114,9 @@ def simuler_auto_oscillation_depuis_fichier(fichier_freqs, t_env, gamma_env, zet
         omega, alpha, F_n, gamma_array_sim, zeta, fs, duree, oversample
     )
     
-    return t_eval_audio, p_tot_adim
+    # On renvoie aussi gamma sous-échantillonné pour le plot
+    gamma_audio = gamma_array_sim[::oversample][:len(t_eval_audio)]
+    return t_eval_audio, p_tot_adim, gamma_audio
 
 def simulation_et_audio():
     params = charger_parametres("config.json")
@@ -113,6 +124,7 @@ def simulation_et_audio():
     fs = params["simulation"]["fs"]
     duree = params["simulation"]["duree"]
     r_in = params["geometrie"]["r_list"][0]
+    N_modes = params["simulation"]["n_modes"]
     
     # --- PARAMÉTRAGE DE L'ANCHE ---
     Ks_val = 8e6        
@@ -133,7 +145,7 @@ def simulation_et_audio():
         (3.35, 2700.0), (3.70, 1700.0), (4.10, 4500.0), (duree, 100.0)       
     ]
     enveloppe_souffle = [
-        (0.08, 100.0), (duree / 2, 4000.0), (duree, 0.0)
+        (0.08, 100.0), (duree / 2, 5000.0), (duree, 0.0)
     ]
 
     enveloppe_souffle_2 = [
@@ -143,11 +155,17 @@ def simulation_et_audio():
     t_env = np.array([pt[0] for pt in enveloppe_souffle])
     pm_env = np.array([pt[1] for pt in enveloppe_souffle])
     gamma_env = pm_env / pM
+    print(gamma_env)
+
+    # --- RÉGLAGE DU BRUIT DE SOUFFLE ---
+    amp_bruit_pa = 20.0          # Amplitude du bruit en Pa (ex: 10 à 100 Pa)
+    amp_bruit_gamma = amp_bruit_pa / pM
 
     # --- SIMULATION ---
     fichier_freqs = "fichier_freqs.txt"
-    t, p_modes_adim = simuler_auto_oscillation_depuis_fichier(
-        fichier_freqs, t_env, gamma_env, zeta, fs, duree
+    t, p_modes_adim, gamma_audio = simuler_auto_oscillation_depuis_fichier(
+        fichier_freqs, N_modes, t_env, gamma_env, zeta, fs, duree,
+        amp_bruit_gamma=amp_bruit_gamma
     )
     
     # Pression interne acoustique dans le bec (Pa)
@@ -174,24 +192,38 @@ def simulation_et_audio():
     
     print(f"-> Audio généré : {fichier_audio}")
 
-    # # --- AFFICHAGE ---
-    # pm_plot = np.interp(t, t_env, pm_env)
-    # fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    
-    # ax1.plot(t, pm_plot, color='C1', linewidth=2)
-    # ax1.set_title("Profil de Pression de Souffle (Entrée)")
-    # ax1.set_ylabel("Pression (Pa)")
-    # ax1.grid(True, alpha=0.5)
+    t_eval_sim = np.arange(0, duree, 1.0 / (44100))
+    gamma_array_sim = np.interp(t_eval_sim, t_env, gamma_env)
+    A_array = np.where(
+        gamma_audio > 1e-9,
+        zeta * (3.0 * gamma_audio - 1.0) / (2.0 * np.sqrt(np.maximum(gamma_audio, 1e-9))),
+        0.0
+    )
 
-    # ax2.plot(t, p_interne_bec, color='C4', linewidth=0.8)
-    # ax2.set_title("Pression acoustique interne dans le bec (Auto-oscillation)")
-    # ax2.set_xlabel("Temps (s)")
-    # ax2.set_ylabel("Pression (Pa)")
-    # ax2.grid(True, alpha=0.5)
-    
-    # plt.xlim(0, duree)
-    # plt.tight_layout()
-    # plt.show()
+    indices = np.arange(len(p_audio_norm))
+
+    plt.figure()
+    plt.plot(indices, p_audio_norm)
+
+    # On place 10 graduations régulièrement espacées avec les valeurs correspondantes de A_array
+    nb_ticks = 10
+    tick_positions = np.linspace(0, len(A_array) - 1, nb_ticks, dtype=int)
+    tick_labels = [f"{A_array[i]:.2f}" for i in tick_positions]
+
+    plt.xticks(tick_positions, tick_labels)
+    plt.xlabel("A (ordre chronologique)")
+    plt.ylabel("p_audio_norm")
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax = plt.gca()
+
+    def format_coord(x, y):
+        idx = int(round(x))
+        if 0 <= idx < len(A_array):
+            return f"idx={idx} | t={t[idx]:.3f}s | A={A_array[idx]:.3f} | y={y:.1f}"
+        return f"x={x:.1f}, y={y:.1f}"
+
+    ax.format_coord = format_coord
+    plt.show()
 
 if __name__ == "__main__":
     simulation_et_audio()
